@@ -1,10 +1,10 @@
-This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
 
 <file_summary>
 This section contains a summary of this file.
 
 <purpose>
-This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+This file contains a packed representation of the entire repository's contents.
 It is designed to be easily consumable by AI systems for analysis, code review,
 or other automated processes.
 </purpose>
@@ -32,7 +32,6 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
-- Files matching these patterns are excluded: **/__pycache__/**
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -42,937 +41,787 @@ The content is organized as follows:
 
 <directory_structure>
 engine/
-  experiments/
-    drop.py
-    measure_position.py
-    push.py
-    timer.py
-    weigh.py
-  forces/
-    collisions.py
-    friction.py
-    gravity.py
-  sensors/
-    position_sensor.py
-    time_sensor.py
   __init__.py
   config.py
+  forces.py
   integrator.py
-  object.py
+  sensor.py
   world.py
 tests/
-  brutal_physics_test.py
-  test_discovery.py
-  test_phase1.py
-pyproject.toml
+  test_physics.py
+.gitignore
+api.py
 README.md
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path="engine/experiments/drop.py">
-import random
+<file path="engine/forces.py">
+import numpy as np
 
-class DropExperiment:
-    def __init__(self, world, noise_std=1e-3):
-        """
-        Initializes the drop experiment within a specific world.
-        """
-        self.world = world
-        self.noise_std = noise_std
+def _safe_dir(diff: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """
+    Safely compute direction vectors, avoiding division by zero.
 
-    def drop(self, obj, drop_height, initial_x=0.0):
-        """
-        Releases an object into the world at a specified height.
-        The physics engine takes over. This function returns nothing.
-        Experimental imperfection is applied to initial conditions.
-        """
-        # We assume index 1 is Y (height), and index 0 is X
-        actual_x = initial_x + random.gauss(0, self.noise_std)
-        actual_y = drop_height + random.gauss(0, self.noise_std)
-        
-        if len(obj.position) > 1:
-            obj.position[0] = actual_x
-            obj.position[1] = actual_y
-        else:
-            obj.position[0] = actual_y
-            
-        # Tiny random variance in initial velocity (v_0 ± epsilon)
-        obj.velocity = [random.gauss(0, self.noise_std) for _ in obj.velocity]
-        
-        # Ensure object is in the world
-        if obj not in self.world.objects:
-            self.world.add_object(obj)
-            
-        # Note: The simulation loop must be run separately via world.run()
-</file>
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
 
-<file path="engine/experiments/measure_position.py">
-class MeasurePositionExperiment:
-    def __init__(self, position_sensor):
-        """
-        An experiment that acts as an interface to the PositionSensor.
-        The AI interacts with this experiment to get position data, keeping them away
-        from raw engine objects or internal sensor properties if we lock it down later.
-        """
-        self.sensor = position_sensor
+    Returns
+    -------
+    numpy.ndarray
+        Normalized direction vectors, shape (N, N, D).
+    """
+    safe_dist = np.maximum(dist, 1e-12)
+    return diff / safe_dist[..., np.newaxis]
 
-    def measure(self):
-        """
-        Requests a reading from the underlying position sensor.
-        Returns the noisy position vector, or the stale reading if queried faster than the update rate.
-        """
-        return self.sensor.read()
-</file>
+def linear_spring(diff: np.ndarray, dist: np.ndarray, k: np.ndarray, r0: np.ndarray) -> np.ndarray:
+    """
+    Compute linear spring force.
 
-<file path="engine/experiments/push.py">
-import random
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    k : numpy.ndarray
+        Spring constants, shape (N, N).
+    r0 : numpy.ndarray
+        Rest lengths, shape (N, N).
 
-class PushExperiment:
-    # Map qualitative strengths to approximate force magnitudes
-    STRENGTH_MAP = {
-        "soft": 1.0,
-        "medium": 5.0,
-        "hard": 10.0,
-        "very_hard": 20.0
-    }
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    mag = -k * (dist - r0)
+    return mag[..., np.newaxis] * direction
 
-    def __init__(self, world, force_noise_std=0.5, pos_noise_std=1e-3, vel_noise_std=1e-3):
-        """
-        Initializes the push experiment within a specific world.
-        """
-        self.world = world
-        self.force_noise_std = force_noise_std
-        self.pos_noise_std = pos_noise_std
-        self.vel_noise_std = vel_noise_std
-        self.active_pushes = [] # Track pushes currently happening
+def duffing_oscillator(diff: np.ndarray, dist: np.ndarray, k: np.ndarray, r0: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """
+    Compute Duffing oscillator force.
 
-    def apply(self, obj, direction, strength="medium", duration=1.0):
-        """
-        Initiates a push on an object with experimental imperfection.
-        Accepts only qualitative strengths.
-        Does not return anything; the world will handle the force application over time.
-        """
-        # Validate strength input
-        if strength not in self.STRENGTH_MAP:
-            strength = "medium"
-            
-        base_force = self.STRENGTH_MAP[strength]
-        
-        # Add a realistic variation to the force magnitude once per push
-        actual_force_magnitude = abs(base_force + random.gauss(0, self.force_noise_std))
-        
-        # Normalize direction vector and calculate components
-        dir_magnitude = sum(d**2 for d in direction)**0.5
-        if dir_magnitude == 0:
-            return # Avoid arbitrary directions
-            
-        force_vector = [(d / dir_magnitude) * actual_force_magnitude for d in direction]
-        
-        # Experimental imperfection: tiny initial random variance in position and velocity
-        for i in range(len(obj.position)):
-            obj.position[i] += random.gauss(0, self.pos_noise_std)
-        for i in range(len(obj.velocity)):
-            obj.velocity[i] += random.gauss(0, self.vel_noise_std)
-        
-        # Register the planned push with the world/experiment tracker
-        push_event = {
-            "object": obj,
-            "force_vector": force_vector,
-            "remaining_time": duration
-        }
-        
-        # We add this to the world's active experiments list or handle it in a tick abstract
-        if obj not in self.world.objects:
-            self.world.add_object(obj)
-            
-        self.world.active_events.append(push_event)
-</file>
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    k : numpy.ndarray
+        Linear spring constants, shape (N, N).
+    r0 : numpy.ndarray
+        Rest lengths, shape (N, N).
+    alpha : numpy.ndarray
+        Nonlinear spring constants, shape (N, N).
 
-<file path="engine/experiments/timer.py">
-class TimerExperiment:
-    def __init__(self, time_sensor):
-        """
-        A stopwatch-like experiment that utilizes a TimeSensor.
-        Allows the AI user to start and stop the timer to measure elapsed simulation time.
-        """
-        self.sensor = time_sensor
-        self.start_reading = 0.0
-        self.is_running = False
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    disp = dist - r0
+    mag = -k * disp - alpha * (disp ** 3)
+    return mag[..., np.newaxis] * direction
 
-    def start(self):
-        """
-        Starts the timer by recording the current noisy time from the sensor.
-        Returns nothing to conceal the absolute internal time from the AI.
-        """
-        self.start_reading = self.sensor.read()
-        self.is_running = True
+def velocity_damper(vel: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """
+    Compute global velocity damping force.
 
-    def stop(self):
-        """
-        Stops the timer and returns the noisy elapsed time.
-        """
-        if not self.is_running:
-            return 0.0
-            
-        end_reading = self.sensor.read()
-        self.is_running = False
-        
-        # Calculate elapsed time (could be slightly negative due to high noise or tiny durations)
-        # So we clamp it to 0.0 logically
-        elapsed = max(0.0, end_reading - self.start_reading)
-        return elapsed
+    Parameters
+    ----------
+    vel : numpy.ndarray
+        Particle velocities, shape (N, D).
+    c : numpy.ndarray
+        Damping coefficients, shape (N, 1) or scalar.
 
-    def reset(self):
-        """
-        Resets the stopwatch.
-        """
-        self.is_running = False
-        self.start_reading = 0.0
-</file>
+    Returns
+    -------
+    numpy.ndarray
+        Damping force vectors, shape (N, D).
+    """
+    return -c * vel
 
-<file path="engine/experiments/weigh.py">
-import random
-from engine.config import SENSOR_CONFIG
+def newtonian_gravity(diff: np.ndarray, dist: np.ndarray, G: float, m_i: np.ndarray, m_j: np.ndarray) -> np.ndarray:
+    """
+    Compute Newtonian gravitational force.
 
-class WeighExperiment:
-    def __init__(self, precision="medium"):
-        """
-        An experiment that allows the AI to loosely determine the mass of an object,
-        acting like a digital or mechanical scale.
-        """
-        # Load precision map from config
-        config = SENSOR_CONFIG.get("weigh_sensor", {})
-        self.precision_map = config.get("precision_map", {
-            "low": 0.5,
-            "medium": 0.1,
-            "high": 0.01
-        })
-        
-        # Determine standard deviation based on requested precision
-        self.noise_std = self.precision_map.get(precision, 0.1)
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    G : float
+        Gravitational constant.
+    m_i : numpy.ndarray
+        Masses of particle i, shape (N, 1).
+    m_j : numpy.ndarray
+        Masses of particle j, shape (1, N).
 
-    def measure(self, obj):
-        """
-        Performs the weighing action and returns a noisy mass reading.
-        The AI never gets direct access to obj.mass.
-        """
-        noisy_mass = obj.mass + random.gauss(0, self.noise_std)
-        # Prevent negative mass readings which don't make sense physically
-        return max(0.01, noisy_mass)
-</file>
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    safe_dist = np.maximum(dist, 1e-12)
+    mag = -G * (m_i * m_j) / (safe_dist ** 2)
+    return mag[..., np.newaxis] * direction
 
-<file path="engine/forces/collisions.py">
-import random
+def coulomb(diff: np.ndarray, dist: np.ndarray, k_e: float, q_i: np.ndarray, q_j: np.ndarray) -> np.ndarray:
+    """
+    Compute Coulomb force.
 
-class Collisions:
-    def __init__(self, ground_y=0.0, restitution=0.5, noise_std=0.02):
-        """
-        Manages collisions for the simulation.
-        Phase 1 primarily handles objects colliding with a ground plane.
-        """
-        self.ground_y = ground_y
-        self.restitution = restitution
-        self.noise_std = noise_std
-        
-    def apply(self, objects, old_positions=None):
-        """
-        Checks for collisions and resolves them by directly modifying velocity.
-        Adds slight randomness to simulate real-world imperfect bounces.
-        Uses old_positions to perform raycasting against the ground plane.
-        """
-        for obj in objects:
-            # Assuming 2D/3D where Y is the up/down axis (index 1)
-            # Or if 1D, index 0. Let's assume index 1 for Y.
-            # If 1D, position[0] is height. We'll check length.
-            
-            y_index = 1 if len(obj.position) > 1 else 0
-            
-            old_y = obj.position[y_index]
-            if old_positions and id(obj) in old_positions:
-                old_y = old_positions[id(obj)][y_index]
-                
-            new_y = obj.position[y_index]
-            
-            # Raycasting collision check: Did the object cross the ground plane this step, or is it already below?
-            if (old_y > self.ground_y and new_y <= self.ground_y) or (new_y <= self.ground_y):
-                # Snap to ground to prevent sinking
-                obj.position[y_index] = self.ground_y
-                
-                # Resolve velocity if moving downward
-                if obj.velocity[y_index] < 0:
-                    bounce_factor = self.restitution + random.gauss(0, self.noise_std)
-                    bounce_factor = max(0.0, min(1.0, bounce_factor)) # Clamp between 0 and 1
-                    
-                    obj.velocity[y_index] = -obj.velocity[y_index] * bounce_factor
-                    
-                    # Prevent micro-sinking by stopping the object if velocity is negligible
-                    if abs(obj.velocity[y_index]) < 0.1:
-                        obj.velocity[y_index] = 0.0
-</file>
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    k_e : float
+        Coulomb constant.
+    q_i : numpy.ndarray
+        Charges of particle i, shape (N, 1).
+    q_j : numpy.ndarray
+        Charges of particle j, shape (1, N).
 
-<file path="engine/forces/friction.py">
-from engine.config import GRAVITY, DT
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    safe_dist = np.maximum(dist, 1e-12)
+    mag = k_e * (q_i * q_j) / (safe_dist ** 2)
+    return mag[..., np.newaxis] * direction
 
-class Friction:
-    def __init__(self, ground_y=0.0, mu_s=0.6, mu_k=0.4):
-        """
-        Applies static and kinetic friction to objects, opposing their horizontal motion.
-        """
-        self.ground_y = ground_y
-        self.mu_s = mu_s
-        self.mu_k = mu_k
-        if isinstance(GRAVITY, dict):
-            self.g_strength = abs(GRAVITY.get("strength", -9.81))
-        else:
-            self.g_strength = abs(float(GRAVITY))
+def yukawa(diff: np.ndarray, dist: np.ndarray, k: np.ndarray, kappa: np.ndarray) -> np.ndarray:
+    """
+    Compute Yukawa force.
 
-    def apply(self, objects):
-        """
-        Applies friction force opposing velocity or applied forces.
-        """
-        for obj in objects:
-            if obj.mass <= 0:
-                continue
-                
-            y_index = 1 if len(obj.position) > 1 else -1 
-            # If 1D, assume it's always on the ground
-            on_ground = True
-            if y_index != -1:
-                on_ground = (obj.position[y_index] <= self.ground_y + 1e-5)
-            
-            if on_ground:
-                N = obj.mass * self.g_strength
-                
-                # Calculate horizontal speed
-                v_sq = 0.0
-                for i in range(len(obj.velocity)):
-                    if i != y_index:
-                        v_sq += obj.velocity[i]**2
-                speed = v_sq**0.5
-                
-                # Calculate horizontal external force
-                f_ext_sq = 0.0
-                for i in range(len(obj.force_accumulator)):
-                    if i != y_index:
-                        f_ext_sq += obj.force_accumulator[i]**2
-                external_force_mag = f_ext_sq**0.5
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    k : numpy.ndarray
+        Coupling constants, shape (N, N).
+    kappa : numpy.ndarray
+        Inverse length scales, shape (N, N).
 
-                if speed < 1e-4:
-                    # Static friction
-                    max_static = self.mu_s * N
-                    if external_force_mag <= max_static:
-                        # Cancel horizontal forces
-                        for i in range(len(obj.force_accumulator)):
-                            if i != y_index:
-                                obj.force_accumulator[i] = 0.0
-                        for i in range(len(obj.velocity)):
-                            if i != y_index:
-                                obj.velocity[i] = 0.0
-                    else:
-                        # Overcame static friction, now kinetic friction applies
-                        friction_mag = self.mu_k * N
-                        for i in range(len(obj.force_accumulator)):
-                            if i != y_index:
-                                dir_component = obj.force_accumulator[i] / external_force_mag
-                                obj.force_accumulator[i] -= dir_component * friction_mag
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    safe_dist = np.maximum(dist, 1e-12)
+    mag = k * np.exp(-kappa * safe_dist) * (1.0 / (safe_dist ** 2) + kappa / safe_dist)
+    return mag[..., np.newaxis] * direction
+
+def morse(diff: np.ndarray, dist: np.ndarray, D_e: np.ndarray, a: np.ndarray, r_e: np.ndarray) -> np.ndarray:
+    """
+    Compute Morse potential force.
+
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    D_e : numpy.ndarray
+        Well depths, shape (N, N).
+    a : numpy.ndarray
+        Well widths, shape (N, N).
+    r_e : numpy.ndarray
+        Equilibrium distances, shape (N, N).
+
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    exp_term = np.exp(-a * (dist - r_e))
+    mag = -2 * a * D_e * (1 - exp_term) * exp_term
+    return mag[..., np.newaxis] * direction
+
+def buckingham(diff: np.ndarray, dist: np.ndarray, A: np.ndarray, B: np.ndarray, C: np.ndarray) -> np.ndarray:
+    """
+    Compute Buckingham potential force.
+
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    A : numpy.ndarray
+        Repulsive exponential constants, shape (N, N).
+    B : numpy.ndarray
+        Repulsive exponential scales, shape (N, N).
+    C : numpy.ndarray
+        Attractive dispersion constants, shape (N, N).
+
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    safe_dist = np.maximum(dist, 1e-12)
+    mag = A * B * np.exp(-B * safe_dist) - 6 * C / (safe_dist ** 7)
+    return mag[..., np.newaxis] * direction
+
+def hertzian_contact(diff: np.ndarray, dist: np.ndarray, K: np.ndarray, R_sum: np.ndarray) -> np.ndarray:
+    """
+    Compute Hertzian contact force.
+
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    K : numpy.ndarray
+        Contact stiffness constants, shape (N, N).
+    R_sum : numpy.ndarray
+        Sum of radii for contact, shape (N, N).
+
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    mag = np.where(dist < R_sum, K * (R_sum - dist)**1.5, 0.0)
+    return mag[..., np.newaxis] * direction
+
+def pairwise_drag(vel: np.ndarray, c: np.ndarray) -> np.ndarray:
+    """
+    Compute pairwise drag force between particles.
+
+    Parameters
+    ----------
+    vel : numpy.ndarray
+        Particle velocities, shape (N, D).
+    c : numpy.ndarray
+        Drag coefficients, shape (N, N).
+
+    Returns
+    -------
+    numpy.ndarray
+        Drag force vectors, shape (N, N, D).
+    """
+    diff_vel = vel[:, None, :] - vel[None, :, :]
+    return -c[..., np.newaxis] * diff_vel
+
+def lennard_jones(diff: np.ndarray, dist: np.ndarray, epsilon: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+    """
+    Compute Lennard-Jones potential force.
+
+    Parameters
+    ----------
+    diff : numpy.ndarray
+        Displacement vectors, shape (N, N, D).
+    dist : numpy.ndarray
+        Distance magnitudes, shape (N, N).
+    epsilon : numpy.ndarray
+        Depth of potential well, shape (N, N).
+    sigma : numpy.ndarray
+        Finite distance where inter-particle potential is zero, shape (N, N).
+
+    Returns
+    -------
+    numpy.ndarray
+        Force vectors, shape (N, N, D).
+    """
+    direction = _safe_dir(diff, dist)
+    safe_dist = np.maximum(dist, 1e-12)
+    ratio_6 = (sigma / safe_dist)**6
+    ratio_12 = ratio_6**2
+    mag = 24 * epsilon * (2 * ratio_12 - ratio_6) / safe_dist
+    return mag[..., np.newaxis] * direction
+
+def evaluate_forces(pos: np.ndarray, vel: np.ndarray, force_graph: dict) -> np.ndarray:
+    """
+    Evaluate total forces on all particles.
+
+    Parameters
+    ----------
+    pos : numpy.ndarray
+        Particle positions, shape (N, D).
+    vel : numpy.ndarray
+        Particle velocities, shape (N, D).
+    force_graph : dict
+        Force interaction graph dictionary specifying active forces and parameters.
+
+    Returns
+    -------
+    numpy.ndarray
+        Total force vectors on each particle, shape (N, D).
+    """
+    n_particles = pos.shape[0]
+    
+    diff = pos[:, None, :] - pos[None, :, :]
+    dist = np.linalg.norm(diff, axis=-1)
+    
+    np.fill_diagonal(dist, np.inf)
+    
+    total_force = np.zeros_like(pos)
+    
+    with np.errstate(invalid='ignore', divide='ignore'):
+        for force_name, params in force_graph.items():
+            if force_name == "velocity_damper":
+                total_force += velocity_damper(vel, **params)
+            elif force_name == "pairwise_drag":
+                f_ij = pairwise_drag(vel, **params)
+                f_ij[np.eye(n_particles, dtype=bool)] = 0.0
+                total_force += np.sum(f_ij, axis=1)
+            else:
+                if force_name == "linear_spring":
+                    f_ij = linear_spring(diff, dist, **params)
+                elif force_name == "duffing_oscillator":
+                    f_ij = duffing_oscillator(diff, dist, **params)
+                elif force_name == "newtonian_gravity":
+                    f_ij = newtonian_gravity(diff, dist, **params)
+                elif force_name == "coulomb":
+                    f_ij = coulomb(diff, dist, **params)
+                elif force_name == "yukawa":
+                    f_ij = yukawa(diff, dist, **params)
+                elif force_name == "morse_potential":
+                    f_ij = morse(diff, dist, **params)
+                elif force_name == "buckingham":
+                    f_ij = buckingham(diff, dist, **params)
+                elif force_name == "hertzian_contact":
+                    f_ij = hertzian_contact(diff, dist, **params)
+                elif force_name == "lennard_jones":
+                    f_ij = lennard_jones(diff, dist, **params)
                 else:
-                    # Kinetic friction
-                    friction_mag = self.mu_k * N
-                    for i in range(len(obj.force_accumulator)):
-                        if i != y_index:
-                            dir_component = obj.velocity[i] / speed
-                            f_fric = dir_component * friction_mag
-                            
-                            # Prevent friction from reversing velocity in a single timestep
-                            max_fric = (obj.mass * abs(obj.velocity[i])) / DT
-                            if abs(f_fric) > max_fric:
-                                sign = 1 if f_fric > 0 else -1
-                                f_fric = sign * max_fric
-                                
-                            obj.force_accumulator[i] -= f_fric
-</file>
-
-<file path="engine/forces/gravity.py">
-from engine.config import GRAVITY
-
-class GravityForce:
-    def __init__(self, axis_index=None):
-        """
-        Applies continuous gravitational force to all objects axially agnostic.
-        Reuses vector objects to prevent memory allocation spikes.
-        """
-        if isinstance(GRAVITY, dict):
-            self.g_strength = GRAVITY.get("strength", -9.81)
-        else:
-            self.g_strength = float(GRAVITY)
-            
-        self.axis_index = axis_index
-        self._cached_vectors = {}
-
-    def apply(self, objects):
-        """
-        Applies F = mg to each object's force accumulator without allocating new lists.
-        """
-        for obj in objects:
-            if obj.mass <= 0:
-                 continue
-                 
-            dim = len(obj.position)
-            axis = self.axis_index if self.axis_index is not None else (1 if dim > 1 else 0)
-            
-            if dim not in self._cached_vectors:
-                self._cached_vectors[dim] = [0.0] * dim
+                    raise ValueError(f"Unknown force type in force_graph: {force_name}")
+                    
+                f_ij[np.eye(n_particles, dtype=bool)] = 0.0
+                total_force += np.sum(f_ij, axis=1)
                 
-            f_vec = self._cached_vectors[dim]
-            # Reset the cached vector
-            for i in range(dim):
-                f_vec[i] = 0.0
-                
-            # Set the gravity component
-            f_vec[axis] = obj.mass * self.g_strength
-            
-            obj.apply_force(f_vec)
+    return total_force
 </file>
 
-<file path="engine/sensors/position_sensor.py">
-import random
-from engine.config import SENSOR_CONFIG, DT
+<file path="engine/sensor.py">
+import numpy as np
+from scipy.signal import savgol_filter
+from typing import Tuple
 
-class PositionSensor:
-    def __init__(self, obj):
-        """
-        A sensor that provides real-time noisy position readings.
-        Simulates measurement jitter/lag and spatial noise.
-        """
-        self.obj = obj
-        
-        # Load configuration for this sensor type
-        config = SENSOR_CONFIG.get("position_sensor", {})
-        self.noise_std = config.get("noise_std", 0.05)
-        self.lag_std = config.get("lag_std", 0.02) # Seconds of lag to simulate jitter
-        
-    def tick(self):
-        """
-        Called every timestep by the world.
-        Staircase lock removed. Method retained for API compatibility.
-        """
-        pass
+from .config import STEPS, DT
 
-    def read(self):
-        """
-        Returns a live noisy position reading, incorporating simulated measurement lag via velocity.
-        """
-        noisy_position = []
-        for p, v in zip(self.obj.position, self.obj.velocity):
-            # Jitter: simulated lag (time delay error) * current velocity
-            lag_error = random.gauss(0, self.lag_std) * v
-            # Spatial noise
-            spatial_error = random.gauss(0, self.noise_std)
-            noisy_position.append(p + lag_error + spatial_error)
+def apply_sensor_noise(trajectory_pos: np.ndarray, trajectory_vel: np.ndarray, noise_level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Inject Gaussian noise and estimate accelerations via Savitzky-Golay filtering.
+
+    Parameters
+    ----------
+    trajectory_pos : numpy.ndarray
+        Ground-truth positions, shape (STEPS, N, D).
+    trajectory_vel : numpy.ndarray
+        Ground-truth velocities, shape (STEPS, N, D).
+    noise_level : float
+        Standard deviation for Gaussian noise.
+
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - noisy_positions : numpy.ndarray
+            Shape (STEPS, N, D).
+        - noisy_velocities : numpy.ndarray
+            Shape (STEPS, N, D).
+        - sg_accelerations : numpy.ndarray
+            Shape (STEPS, N, D).
+    
+    Notes
+    -----
+    The Savitzky-Golay filter utilizes a window length of 11 and a polynomial order of 3 as dictated by experimental constraints.
+    """
+    noisy_positions = trajectory_pos + np.random.normal(0.0, noise_level, trajectory_pos.shape)
+    noisy_velocities = trajectory_vel + np.random.normal(0.0, noise_level, trajectory_vel.shape)
+    
+    window_length = 11
+    if STEPS < window_length:
+        window_length = STEPS if STEPS % 2 != 0 else STEPS - 1
+        
+    if window_length > 3:
+        sg_accelerations = savgol_filter(
+            noisy_velocities,
+            window_length=window_length,
+            polyorder=3,
+            deriv=1,
+            delta=DT,
+            axis=0,
+            mode='interp'
+        )
+    else:
+        sg_accelerations = np.zeros_like(noisy_velocities)
+        if STEPS > 1:
+            sg_accelerations[1:] = (noisy_velocities[1:] - noisy_velocities[:-1]) / DT
             
-        return noisy_position
+    return noisy_positions, noisy_velocities, sg_accelerations
 </file>
 
-<file path="engine/sensors/time_sensor.py">
-import random
-from engine.config import SENSOR_CONFIG, DT
+<file path="tests/test_physics.py">
+import pytest
+import numpy as np
 
-class TimeSensor:
-    def __init__(self):
-        """
-        A sensor that tracks the passage of simulation time.
-        """
-        config = SENSOR_CONFIG.get("time_sensor", {})
-        self.noise_std = config.get("noise_std", 0.005)
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from api import run_experiment
+from engine.config import MIN_DIST, MAX_POS
+from engine.world import STEPS
+from engine.forces import evaluate_forces
+
+def test_energy_conservation():
+    """1. Symplectic Energy Conservation Test: Duffing Oscillator"""
+    masses = np.array([1.0, 1.0])
+    # Place them symmetrically with a small displacement from r0=1.0
+    init_pos = np.array([[-0.6], [0.6]])
+    # Initial velocity zero to prevent large kinetic energy crossing
+    init_vel = np.array([[0.0], [0.0]])
+    
+    k_mat = np.array([[0.0, 1.0], [1.0, 0.0]])
+    r0_mat = np.array([[0.0, 1.0], [1.0, 0.0]])
+    alpha_mat = np.array([[0.0, 0.1], [0.1, 0.0]])
+    
+    force_graph = {
+        "duffing_oscillator": {
+            "k": k_mat,
+            "r0": r0_mat,
+            "alpha": alpha_mat
+        }
+    }
+    
+    valid, p, v, a = run_experiment(masses, init_pos, init_vel, force_graph, noise_level=0.0)
+    
+    assert valid, "Simulation should be valid for energy conservation test. Check coordinates/velocities."
+    
+    def calc_energy(step_idx):
+        pos = p[step_idx]
+        vel = v[step_idx]
         
-        self.internal_time = 0.0
+        # Kinetic energy
+        K = 0.5 * np.sum(masses[:, None] * vel**2)
+        
+        # Potential energy
+        diff = pos[0] - pos[1]
+        dist = np.linalg.norm(diff)
+        
+        k = k_mat[0, 1]
+        r0 = r0_mat[0, 1]
+        alpha = alpha_mat[0, 1]
+        
+        disp = dist - r0
+        U = 0.5 * k * disp**2 + 0.25 * alpha * disp**4
+        return K + U
+        
+    E_initial = calc_energy(0)
+    E_final = calc_energy(-1)
+    
+    assert E_initial > 0, "Initial energy must be > 0 for valid relative error checking."
+    
+    error_pct = abs(E_initial - E_final) / E_initial
+    assert error_pct < 1e-4, f"Energy conservation violated! Relative error {error_pct*100:.4f}% > 0.01%. E_initial: {E_initial:.6f}, E_final: {E_final:.6f}"
 
-    def tick(self):
-        """
-        Called every timestep by the world to update internal tracking.
-        """
-        self.internal_time += DT
+def test_singularity_trap():
+    """2. The Singularity Trap: Newtonian Gravity"""
+    masses = np.array([1.0, 1.0])
+    
+    # Place masses directly on top of each other (dist < MIN_DIST)
+    init_pos = np.array([[0.0, 0.0], [MIN_DIST * 0.5, 0.0]])
+    init_vel = np.array([[0.0, 0.0], [0.0, 0.0]])
+    
+    force_graph = {
+        "newtonian_gravity": {
+            "G": 1.0,
+            "m_i": np.array([[1.0, 1.0], [1.0, 1.0]]),
+            "m_j": np.array([[1.0, 1.0], [1.0, 1.0]])
+        }
+    }
+    
+    valid, _, _, _ = run_experiment(masses, init_pos, init_vel, force_graph, noise_level=0.0)
+    
+    assert not valid, f"Engine failed to catch division-by-zero! Distance < MIN_DIST={MIN_DIST} did not trigger INVALID."
 
-    def read(self):
-        """
-        Returns a noisy reading of the current simulation time.
-        """
-        # Time shouldn't go completely backwards in reality, but noise can make it fluctuate slightly.
-        # Ensure returned time is not less than 0. 
-        noisy_time = self.internal_time + random.gauss(0, self.noise_std)
-        return max(0.0, noisy_time)
+def test_explosion_trap():
+    """3. The Explosion Trap: Coulomb Repulsion"""
+    masses = np.array([1.0, 1.0])
+    
+    # Place them moderately close
+    init_pos = np.array([[-0.1, 0.0], [0.1, 0.0]])
+    init_vel = np.array([[0.0, 0.0], [0.0, 0.0]])
+    
+    # Massive repulsive charges designed to blast particles past MAX_POS
+    force_graph = {
+        "coulomb": {
+            "k_e": 1e9, 
+            "q_i": np.array([[1.0, 1.0], [1.0, 1.0]]),
+            "q_j": np.array([[1.0, 1.0], [1.0, 1.0]])
+        }
+    }
+    
+    valid, p, _, _ = run_experiment(masses, init_pos, init_vel, force_graph, noise_level=0.0)
+    
+    assert not valid, f"Engine failed to catch explosion! Huge repulsion did not trigger INVALID (exceed MAX_POS={MAX_POS})."
+
+def test_sensor_accuracy_verification():
+    """4. Sensor Accuracy Verification: Linear Spring"""
+    masses = np.array([1.0, 1.0])
+    init_pos = np.array([[-0.7], [0.7]])
+    init_vel = np.array([[0.0], [0.0]])
+    
+    k_mat = np.array([[0.0, 1.0], [1.0, 0.0]])
+    r0_mat = np.array([[0.0, 1.0], [1.0, 0.0]])
+    
+    force_graph = {
+        "linear_spring": {
+            "k": k_mat,
+            "r0": r0_mat
+        }
+    }
+    
+    valid, noisy_pos, noisy_vel, sg_a = run_experiment(masses, init_pos, init_vel, force_graph, noise_level=0.001)
+    
+    assert valid, "Simulation mathematically exploded, which should not happen for simple linear spring."
+    
+    # Produce cleanly integrated truth 
+    valid_clean, clean_pos, clean_vel, _ = run_experiment(masses, init_pos, init_vel, force_graph, noise_level=0.0)
+    
+    # Calculate analytical accelerations step-by-step
+    true_accel = np.zeros_like(clean_pos)
+    for i in range(STEPS):
+        true_accel[i] = evaluate_forces(clean_pos[i], clean_vel[i], force_graph) / masses[:, None]
+        
+    # Exclude edges due to filter border artifacts
+    margin = 50
+    mae = np.mean(np.abs(sg_a[margin:-margin] - true_accel[margin:-margin]))
+    
+    assert mae < 0.2, f"Savitzky-Golay estimated accelerations wildly off from analytical truth. MAE: {mae}"
+</file>
+
+<file path="api.py">
+"""API entry point for the physics engine simulations."""
+
+from engine.world import run_simulation
+from engine.sensor import apply_sensor_noise
+
+def run_experiment(masses, init_pos, init_vel, force_graph, noise_level):
+    """
+    Execute a full 10,000-step simulation and inject sensor noise into the resulting trajectories.
+
+    Parameters
+    ----------
+    masses : numpy.ndarray
+        Particle masses, shape (N,).
+    init_pos : numpy.ndarray
+        Initial particle positions, shape (N, D).
+    init_vel : numpy.ndarray
+        Initial particle velocities, shape (N, D).
+    force_graph : dict
+        Force interaction graph dictionary specifying active forces and parameters.
+    noise_level : float
+        Standard deviation of the injected Gaussian noise.
+
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - valid : bool
+            True if the simulation completed without degeneracy or singularity, False otherwise.
+        - noisy_pos : numpy.ndarray
+            Noisy position trajectories, shape (STEPS, N, D).
+        - noisy_vel : numpy.ndarray
+            Noisy velocity trajectories, shape (STEPS, N, D).
+        - sg_acc : numpy.ndarray
+            Accelerations estimated via Savitzky-Golay filtering, shape (STEPS, N, D).
+    """
+    valid, pr_pos, pr_vel = run_simulation(masses, init_pos, init_vel, force_graph)
+    noisy_pos, noisy_vel, sg_acc = apply_sensor_noise(pr_pos, pr_vel, noise_level)
+    return valid, noisy_pos, noisy_vel, sg_acc
 </file>
 
 <file path="engine/__init__.py">
-
+"""Blind, perfectly symplectic physics engine for active symbolic regression tasks."""
 </file>
 
 <file path="engine/config.py">
-# Time step for the simulation (s)
+"""Physics engine configuration constants."""
+
 DT = 0.001
-
-UNITS = {
-    "length": "m",
-    "time": "s",
-    "mass": "kg"
-}
-
-# Gravity constant (m/s^2)
-GRAVITY = {
-    "strength": -9.80665,
-    "exponent": 2
-}
-
-# Sensor noise configuration
-# sensor_name: {parameter: value}
-SENSOR_CONFIG = {
-    "position_sensor": {
-        "noise_std": 0.05,  # Standard deviation for Gaussian noise
-        "update_rate": 10   # Hz
-    },
-    "weigh_sensor": {
-        "precision_map": {
-            "low": 0.5,
-            "medium": 0.1,
-            "high": 0.01
-        }
-    },
-    "time_sensor": {
-        "noise_std": 0.005  # Standard deviation for Gaussian noise in seconds
-    }
-}
-
-# Active forces and integrators
-# List of force module names or types to be applied
-ACTIVE_FORCES = ["gravity", "collisions", "friction"]
-
-# Integrator type (e.g., 'euler', 'rk4')
-ACTIVE_INTEGRATOR = "euler"
-
-# Integrator specific parameters
-INTEGRATOR_CONFIG = {
-    "euler": {},
-    "rk4": {},
-    "verlet": {"substeps": 4}
-}
+STEPS = 10000
+MAX_POS = 1000.0
+MIN_DIST = 0.001
+MIN_STD = 1e-6
 </file>
 
 <file path="engine/integrator.py">
-# Handles numerical integration of equations of motion
-from engine.config import DT
+import numpy as np
 
-def semi_implicit_euler(objects):
+def step_velocity_verlet(pos: np.ndarray, vel: np.ndarray, acc: np.ndarray, dt: float, mass: np.ndarray, force_func: callable) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Applies Semi-Implicit Euler integration to a list of objects.
-    Updates velocities based on accumulated forces, then updates positions.
-    """
-    for obj in objects:
-        if obj.mass <= 0:
-            continue # Avoid division by zero, or handle immovable objects
+    Perform a single step of the Velocity Verlet symplectic numerical integration.
 
-        # Update velocity: v(t+dt) = v(t) + (F/m) * dt
-        for i in range(len(obj.velocity)):
-            acceleration = obj.force_accumulator[i] / obj.mass
-            obj.velocity[i] += acceleration * DT
+    Parameters
+    ----------
+    pos : numpy.ndarray
+        Particle positions, shape (N, D).
+    vel : numpy.ndarray
+        Particle velocities, shape (N, D).
+    acc : numpy.ndarray
+        Particle accelerations, shape (N, D).
+    dt : float
+        Integration time step size.
+    mass : numpy.ndarray
+        Particle masses, shape (N, 1).
+    force_func : callable
+        Function taking (pos, vel) and returning the forces of shape (N, D).
 
-        # Update position: x(t+dt) = x(t) + v(t+dt) * dt
-        for i in range(len(obj.position)):
-            obj.position[i] += obj.velocity[i] * DT
-
-        # Clear forces for the next timestep
-        obj.clear_forces()
-</file>
-
-<file path="engine/object.py">
-# Represents a physical entity in the simulation
-
-class Object:
-    def __init__(self, mass, position, velocity=None):
-        """
-        Initializes a physical object.
-        Internal state should not be directly accessed by the AI user. 
-        """
-        self.mass = mass
-        self.position = list(position)
-        self.velocity = list(velocity) if velocity else [0.0] * len(position)
-        
-        # Accumulate forces applied during a single timestep
-        self.force_accumulator = [0.0] * len(position)
-
-    def apply_force(self, force):
-        """
-        Adds a force vector to the object's force accumulator for the current timestep.
-        """
-        if len(force) != len(self.force_accumulator):
-            raise ValueError(f"Force dimension mismatch. Expected {len(self.force_accumulator)}, got {len(force)}")
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - pos_new : numpy.ndarray
+            New positions at t + dt, shape (N, D).
+        - vel_new : numpy.ndarray
+            New velocities at t + dt, shape (N, D).
+        - acc_new : numpy.ndarray
+            New accelerations at t + dt, shape (N, D).
             
-        for i in range(len(self.force_accumulator)):
-            self.force_accumulator[i] += force[i]
-
-    def clear_forces(self):
-        """
-        Clears the accumulated forces after integration.
-        """
-        self.force_accumulator = [0.0] * len(self.force_accumulator)
+    Notes
+    -----
+    Velocity Verlet is perfectly symplectic strictly for conservative (position-dependent) forces. 
+    For dissipative (velocity-dependent) forces like drag, it requires an explicit half-step approximation 
+    for velocity, meaning perfect symplecticity is lost and energy drift will occur.
+    """
+    v_half = vel + 0.5 * acc * dt
+    pos_new = pos + v_half * dt
+    
+    forces_new = force_func(pos_new, v_half)
+    acc_new = forces_new / mass
+    
+    vel_new = v_half + 0.5 * acc_new * dt
+    
+    return pos_new, vel_new, acc_new
 </file>
 
 <file path="engine/world.py">
-# Manages the timestep loop, applies forces, and integrates
-from engine.config import DT
-from engine.integrator import semi_implicit_euler
+import numpy as np
+from typing import Tuple
 
-class World:
-    def __init__(self):
-        """
-        Initializes the physics world with empty lists for simulation components.
-        """
-        self.objects = []
-        self.forces = []
-        self.collision_handlers = []
-        self.sensors = []
-        self.active_events = [] # For things like temporary pushes
-        self.step_count = 0
-        self.time = 0.0
+from .config import DT, STEPS, MAX_POS, MIN_DIST, MIN_STD
+from .integrator import step_velocity_verlet
+from .forces import evaluate_forces
 
-    def add_object(self, obj):
-        if obj not in self.objects:
-            self.objects.append(obj)
+def run_simulation(masses: np.ndarray, init_pos: np.ndarray, init_vel: np.ndarray, force_graph: dict) -> Tuple[bool, np.ndarray, np.ndarray]:
+    """
+    Execute mathematical integration over 10,000 steps with strict validity constraints.
 
-    def add_force(self, force):
-        # Separate collisions from continuous forces
-        if type(force).__name__ == "Collisions":
-            self.collision_handlers.append(force)
-        else:
-            self.forces.append(force)
+    Parameters
+    ----------
+    masses : numpy.ndarray
+        Particle masses, shape (N,).
+    init_pos : numpy.ndarray
+        Initial particle positions, shape (N, D).
+    init_vel : numpy.ndarray
+        Initial particle velocities, shape (N, D).
+    force_graph : dict
+        Force interaction graph dictionary specifying active forces and parameters.
 
-    def add_sensor(self, sensor):
-        self.sensors.append(sensor)
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - valid : bool
+            True if the simulation completed without degeneracy or singularity, False otherwise.
+        - trajectory_pos : numpy.ndarray
+            Positions matrix, shape (STEPS, N, D).
+        - trajectory_vel : numpy.ndarray
+            Velocities matrix, shape (STEPS, N, D).
+    """
+    n_particles, dims = init_pos.shape
+    
+    pos = init_pos.copy()
+    vel = init_vel.copy()
+    mass_col = masses.reshape(-1, 1)
+    
+    trajectory_pos = np.zeros((STEPS, n_particles, dims))
+    trajectory_vel = np.zeros((STEPS, n_particles, dims))
+    
+    acc = evaluate_forces(pos, vel, force_graph) / mass_col
+    
+    valid = True
 
-    def step(self):
-        """
-        Advances the simulation by one timestep (DT).
-        """
-        self.step_count += 1
-        self.time = self.step_count * DT
+    for step in range(STEPS):
+        trajectory_pos[step] = pos
+        trajectory_vel[step] = vel
         
-        # Store old positions for raycasting
-        old_positions = {id(obj): list(obj.position) for obj in self.objects}
-
-        # 1. Apply global continuous forces (e.g., gravity)
-        for force in self.forces:
-            force.apply(self.objects)
-            
-        # 2. Apply active experiment events (e.g., ongoing pushes)
-        events_to_keep = []
-        for event in self.active_events:
-            event["object"].apply_force(event["force_vector"])
-            event["remaining_time"] -= DT
-            if event["remaining_time"] > 0:
-                events_to_keep.append(event)
-        self.active_events = events_to_keep
-
-        # 3. Integrate to update velocities and positions
-        semi_implicit_euler(self.objects)
-        
-        # 4. Handle collisions after movement using old positions
-        for handler in self.collision_handlers:
-            handler.apply(self.objects, old_positions)
-
-        # 5. Update sensor internal timers
-        for sensor in self.sensors:
-            if hasattr(sensor, "tick"):
-                sensor.tick()
-
-    def run(self, duration):
-        """
-        Runs the simulation loop for a specified duration in seconds.
-        """
-        steps = int(duration / DT)
-        for _ in range(steps):
-            self.step()
-</file>
-
-<file path="tests/brutal_physics_test.py">
-import sys
-import os
-import math
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from engine.world import World
-from engine.object import Object
-from engine.config import DT
-from engine.forces.gravity import GravityForce
-from engine.forces.collisions import Collisions
-from engine.forces.friction import Friction
-from engine.experiments.drop import DropExperiment
-from engine.experiments.push import PushExperiment
-from engine.sensors.position_sensor import PositionSensor
-
-def test_galileo_and_law():
-    print("--- GALILEO EXPERIMENT ---")
-    world = World()
-    world.add_force(GravityForce(axis_index=1))
-    world.add_force(Collisions(ground_y=0.0, restitution=0.0, noise_std=0.0))
-    
-    obj_light = Object(mass=1.0, position=[0.0, 100.0])
-    obj_heavy = Object(mass=100.0, position=[5.0, 100.0])
-    
-    sensor_light = PositionSensor(obj_light)
-    sensor_heavy = PositionSensor(obj_heavy)
-    world.add_sensor(sensor_light)
-    world.add_sensor(sensor_heavy)
-    
-    exp = DropExperiment(world, noise_std=0.0)
-    exp.drop(obj_light, drop_height=100.0, initial_x=0.0)
-    exp.drop(obj_heavy, drop_height=100.0, initial_x=5.0)
-    
-    hit_time_light = None
-    hit_time_heavy = None
-    
-    history_t = []
-    history_y = []
-    
-    while world.time < 10.0:
-        world.step()
-        l_pos = sensor_light.read()
-        h_pos = sensor_heavy.read()
-        
-        if hit_time_light is None and l_pos[1] <= 0.0:
-            hit_time_light = world.time
-            
-        if hit_time_heavy is None and h_pos[1] <= 0.0:
-            hit_time_heavy = world.time
-            
-        if l_pos[1] > 0.0:
-            history_t.append(world.time)
-            history_y.append(100.0 - l_pos[1])
-            
-        if hit_time_light and hit_time_heavy:
+        if not np.all(np.isfinite(pos)) or np.max(np.abs(pos)) > MAX_POS * 10:
+            valid = False
             break
             
-    print(f"Light object hit at: {hit_time_light:.4f}s")
-    print(f"Heavy object hit at: {hit_time_heavy:.4f}s")
-    assert hit_time_light is not None and hit_time_heavy is not None
-    assert abs(hit_time_light - hit_time_heavy) < 0.05, "Masses fell at different rates!"
-    print("Galileo verification passed: Objects fell at same rate.")
-    
-    g_theoretical = 9.80665
-    if len(history_t) > 10:
-        mid = len(history_t) // 2
-        t = history_t[mid]
-        y_obs = history_y[mid]
+        pos, vel, acc = step_velocity_verlet(
+            pos, vel, acc, DT, mass_col,
+            force_func=lambda p, v: evaluate_forces(p, v, force_graph)
+        )
         
-        g_obs = (2 * y_obs) / (t**2)
-        error = abs(g_obs - g_theoretical)
-        print(f"Theoretical Distance at t={t:.4f}: {0.5 * g_theoretical * t**2:.4f}")
-        print(f"Observed Distance at t={t:.4f}: {y_obs:.4f}")
-        print(f"Discovered Law Gravity Estimate: {g_obs:.4f}")
-        print(f"Discovered Law Error: {error:.4f} m/s^2")
-    
-def test_inertia():
-    print("\n--- INERTIA & FRICTION EXPERIMENT ---")
-    
-    # Test 1: No friction
-    world_no_fric = World()
-    obj1 = Object(mass=2.0, position=[0.0, 0.0])
-    world_no_fric.add_object(obj1)
-    world_no_fric.add_force(GravityForce(axis_index=1))
-    world_no_fric.add_force(Collisions(ground_y=0.0))
-    world_no_fric.add_force(Friction(mu_s=0.0, mu_k=0.0))
-    
-    push = PushExperiment(world_no_fric, force_noise_std=0.0, pos_noise_std=0.0, vel_noise_std=0.0)
-    push.apply(obj1, direction=[1.0, 0.0], strength="hard", duration=0.1) 
-    
-    world_no_fric.run(0.1)
-    v_after_push = obj1.velocity[0]
-    
-    world_no_fric.run(2.0)
-    v_final = obj1.velocity[0]
-    print(f"Frictionless velocity after push: {v_after_push:.4f}, after 2s void: {v_final:.4f}")
-    assert abs(v_after_push - v_final) < 1e-4, "Object slowed down without friction!"
-    
-    # Test 2: Friction
-    world_fric = World()
-    obj2 = Object(mass=2.0, position=[0.0, 0.0])
-    world_fric.add_object(obj2)
-    world_fric.add_force(GravityForce(axis_index=1))
-    world_fric.add_force(Collisions(ground_y=0.0))
-    world_fric.add_force(Friction(mu_s=0.5, mu_k=0.3))
-    
-    push2 = PushExperiment(world_fric, force_noise_std=0.0, pos_noise_std=0.0, vel_noise_std=0.0)
-    push2.apply(obj2, direction=[1.0, 0.0], strength="hard", duration=0.1)
-    
-    world_fric.run(0.1)
-    v2_after_push = obj2.velocity[0]
-    
-    world_fric.run(5.0)
-    v2_final = obj2.velocity[0]
-    
-    print(f"Friction velocity after push: {v2_after_push:.4f}, after 5s sliding: {v2_final:.4f}")
-    assert abs(v2_final) < 1e-4, "Object did not stop despite friction!"
-    print("Inertia verification passed.")
-
-def test_tunneling():
-    print("\n--- TUNNELING STRESS TEST ---")
-    world = World()
-    world.add_force(GravityForce(axis_index=1))
-    world.add_force(Collisions(ground_y=0.0, restitution=0.5, noise_std=0.0))
-    
-    obj = Object(mass=10.0, position=[0.0, 1000.0])
-    exp = DropExperiment(world, noise_std=0.0)
-    exp.drop(obj, drop_height=1000.0, initial_x=0.0)
-    
-    min_y = float('inf')
-    while world.time < 20.0:
-        world.step()
-        if obj.position[1] < min_y:
-            min_y = obj.position[1]
+        diff = pos[:, None, :] - pos[None, :, :]
+        dist = np.linalg.norm(diff, axis=-1)
+        np.fill_diagonal(dist, np.inf)
+        if np.min(dist) < MIN_DIST:
+            valid = False
+            break
             
-    print(f"Lowest Y position recorded: {min_y}")
-    assert min_y >= 0.0, f"Tunneling detected! Object fell to {min_y}"
-    print("Tunneling prevented successfully.")
+    if valid:
+        if not np.all(np.isfinite(trajectory_pos)) or np.max(np.abs(trajectory_pos)) > MAX_POS:
+            valid = False
+            
+    if valid:
+        pos_std = np.std(trajectory_pos, axis=0)
+        pos_std_norm = np.linalg.norm(pos_std, axis=-1)
+        if np.any(pos_std_norm < MIN_STD):
+            valid = False
 
-if __name__ == "__main__":
-    test_galileo_and_law()
-    test_inertia()
-    test_tunneling()
-    print("\nALL BRUTAL PHYSICS TESTS PASSED.")
+    return valid, trajectory_pos, trajectory_vel
 </file>
 
-<file path="tests/test_discovery.py">
-import sys
-import os
+<file path=".gitignore">
+# OS Junk
+.DS_Store
+Thumbs.db
 
-# Ensure the engine is in the path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
 
-from engine.world import World
-from engine.object import Object
-from engine.sensors.time_sensor import TimeSensor
-from engine.sensors.position_sensor import PositionSensor
-from engine.experiments.timer import TimerExperiment
-from engine.experiments.measure_position import MeasurePositionExperiment
-from engine.experiments.weigh import WeighExperiment
+# Virtual Environments (if you set one up later)
+venv/
+.venv/
+env/
 
-def run_discovery_test():
-    print("--- DISCOVERY SENSORS TEST ---")
-    world = World()
-    
-    # Hidden inner object we are testing
-    true_mass = 5.0
-    obj = Object(mass=true_mass, position=[0.0, 0.0])
-    world.add_object(obj)
-    
-    # 1. Weigh checking
-    weigh_exp_low = WeighExperiment(precision="low")
-    weigh_exp_high = WeighExperiment(precision="high")
-    
-    w_low = weigh_exp_low.measure(obj)
-    w_high = weigh_exp_high.measure(obj)
-    
-    print(f"True Mass hidden: {true_mass}")
-    print(f"Weigh (Low Precision): {w_low}")
-    print(f"Weigh (High Precision): {w_high}")
-    
-    # 2. Timer checking
-    t_sensor = TimeSensor()
-    world.add_sensor(t_sensor) # Added to world to tick automatically
-    
-    timer = TimerExperiment(t_sensor)
-    
-    print("\nStarting timer...")
-    timer.start()
-    
-    # Simulate for some time
-    world.run(1.5) # Simulates 1.5 seconds internally
-    
-    elapsed = timer.stop()
-    print(f"Timer reading after 1.5s real simulation: {elapsed} seconds")
-    
-    # 3. Measure Position checking
-    p_sensor = PositionSensor(obj)
-    world.add_sensor(p_sensor) # To tick automatically
-    p_exp = MeasurePositionExperiment(p_sensor)
-    
-    world.run(0.2) # Run a bit more so position sensor ticks
-    
-    pos = p_exp.measure()
-    print(f"Measured Object Position: {pos}")
+# IDEs and Editors
+.vscode/
+.idea/
 
-if __name__ == "__main__":
-    run_discovery_test()
-</file>
-
-<file path="tests/test_phase1.py">
-import sys
-import os
-
-# Ensure the engine is in the path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from engine.world import World
-from engine.object import Object
-from engine.forces.gravity import GravityForce
-from engine.forces.collisions import Collisions
-from engine.experiments.drop import DropExperiment
-from engine.experiments.push import PushExperiment
-from engine.sensors.position_sensor import PositionSensor
-
-def run_drop_test():
-    print("--- DROP TEST ---")
-    world = World()
-    world.add_force(GravityForce())
-    world.add_force(Collisions(ground_y=0.0, restitution=0.5))
-    
-    # AI only knows it creates an object of some mass (hidden here)
-    obj = Object(mass=2.0, position=[0.0, 10.0])
-    
-    sensor = PositionSensor(obj)
-    world.add_sensor(sensor)
-    
-    experiment = DropExperiment(world)
-    print("Initiating drop from 10m...")
-    experiment.drop(obj, drop_height=10.0)
-    
-    # Simulate for 2 seconds
-    world.run(2.0)
-    
-    # Read sensor
-    reading = sensor.read()
-    print(f"Sensor reading after 2s: {reading}")
-
-def run_push_test():
-    print("\n--- PUSH TEST ---")
-    world = World()
-    
-    # Assume 1D motion for push on frictionless surface
-    obj = Object(mass=1.0, position=[0.0])
-    world.add_object(obj)
-    
-    sensor = PositionSensor(obj)
-    world.add_sensor(sensor)
-    
-    experiment = PushExperiment(world)
-    print("Initiating 'hard' push to the right...")
-    experiment.apply(obj, direction=[1.0], strength="hard", duration=0.5)
-    
-    # Simulate for 1 second
-    world.run(1.0)
-    
-    # Read sensor
-    reading = sensor.read()
-    print(f"Sensor reading after 1s: {reading}")
-
-if __name__ == "__main__":
-    run_drop_test()
-    run_push_test()
-</file>
-
-<file path="pyproject.toml">
-
+# Code Packing / AI Tools
+repomix-output.xml
+repomix-output.txt
+.repomixignore
 </file>
 
 <file path="README.md">

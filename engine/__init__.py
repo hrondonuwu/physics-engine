@@ -1,1 +1,1 @@
-"""Exposes the internal core Newtonian physics engine modules and simulation structures."""
+"""Blind, perfectly symplectic physics engine for active symbolic regression tasks."""

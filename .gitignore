@@ -1,0 +1,24 @@
+# OS Junk
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments (if you set one up later)
+venv/
+.venv/
+env/
+
+# IDEs and Editors
+.vscode/
+.idea/
+
+# Code Packing / AI Tools
+repomix-output.xml
+repomix-output.txt
+.repomixignore
+# AI context exclusions
+archive_v1_engine/

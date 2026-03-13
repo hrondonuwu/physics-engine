@@ -1,40 +1,7 @@
-"""Defines global simulation parameters, sensor noise profiles, and active capabilities."""
+"""Physics engine configuration constants."""
+
 DT = 0.001
-
-UNITS = {
-    "length": "m",
-    "time": "s",
-    "mass": "kg"
-}
-
-GRAVITY = {
-    "strength": -9.80665,
-    "exponent": 2
-}
-
-SENSOR_CONFIG = {
-    "position_sensor": {
-        "noise_std": 0.05,
-        "update_rate": 10
-    },
-    "weigh_sensor": {
-        "precision_map": {
-            "low": 0.5,
-            "medium": 0.1,
-            "high": 0.01
-        }
-    },
-    "time_sensor": {
-        "noise_std": 0.005
-    }
-}
-
-ACTIVE_FORCES = ["gravity", "collisions", "friction"]
-
-ACTIVE_INTEGRATOR = "euler"
-
-INTEGRATOR_CONFIG = {
-    "euler": {},
-    "rk4": {},
-    "verlet": {"substeps": 4}
-}
+STEPS = 10000
+MAX_POS = 1000.0
+MIN_DIST = 0.001
+MIN_STD = 1e-6

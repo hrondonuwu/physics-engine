@@ -1,59 +1,77 @@
-"""Coordinates the main simulation loop, force application, and integration phases."""
-from engine.config import DT
-from engine.integrator import semi_implicit_euler
+import numpy as np
+from typing import Tuple
 
-class World:
-    def __init__(self):
-        self.objects = []
-        self.forces = []
-        self.collision_handlers = []
-        self.sensors = []
-        self.active_events = []
-        self.step_count = 0
-        self.time = 0.0
+from .config import DT, STEPS, MAX_POS, MIN_DIST, MIN_STD
+from .integrator import step_velocity_verlet
+from .forces import evaluate_forces
 
-    def add_object(self, obj):
-        if obj not in self.objects:
-            self.objects.append(obj)
+def run_simulation(masses: np.ndarray, init_pos: np.ndarray, init_vel: np.ndarray, force_graph: dict) -> Tuple[bool, np.ndarray, np.ndarray]:
+    """
+    Execute mathematical integration over 10,000 steps with strict validity constraints.
 
-    def add_force(self, force):
-        if type(force).__name__ == "Collisions":
-            self.collision_handlers.append(force)
-        else:
-            self.forces.append(force)
+    Parameters
+    ----------
+    masses : numpy.ndarray
+        Particle masses, shape (N,).
+    init_pos : numpy.ndarray
+        Initial particle positions, shape (N, D).
+    init_vel : numpy.ndarray
+        Initial particle velocities, shape (N, D).
+    force_graph : dict
+        Force interaction graph dictionary specifying active forces and parameters.
 
-    def add_sensor(self, sensor):
-        self.sensors.append(sensor)
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - valid : bool
+            True if the simulation completed without degeneracy or singularity, False otherwise.
+        - trajectory_pos : numpy.ndarray
+            Positions matrix, shape (STEPS, N, D).
+        - trajectory_vel : numpy.ndarray
+            Velocities matrix, shape (STEPS, N, D).
+    """
+    n_particles, dims = init_pos.shape
+    
+    pos = init_pos.copy()
+    vel = init_vel.copy()
+    mass_col = masses.reshape(-1, 1)
+    
+    trajectory_pos = np.zeros((STEPS, n_particles, dims))
+    trajectory_vel = np.zeros((STEPS, n_particles, dims))
+    
+    acc = evaluate_forces(pos, vel, force_graph) / mass_col
+    
+    valid = True
 
-    def step(self):
-        self.step_count += 1
-        self.time = self.step_count * DT
+    for step in range(STEPS):
+        trajectory_pos[step] = pos
+        trajectory_vel[step] = vel
         
-        # Raycasting requires tracking motion vectors pre-integration
-        old_positions = {id(obj): list(obj.position) for obj in self.objects}
-
-        for force in self.forces:
-            force.apply(self.objects)
+        if not np.all(np.isfinite(pos)) or np.max(np.abs(pos)) > MAX_POS * 10:
+            valid = False
+            break
             
-        events_to_keep = []
-        for event in self.active_events:
-            event["object"].apply_force(event["force_vector"])
-            event["remaining_time"] -= DT
-            if event["remaining_time"] > 0:
-                events_to_keep.append(event)
-        self.active_events = events_to_keep
-
-        semi_implicit_euler(self.objects)
+        pos, vel, acc = step_velocity_verlet(
+            pos, vel, acc, DT, mass_col,
+            force_func=lambda p, v: evaluate_forces(p, v, force_graph)
+        )
         
-        # Collisions resolve post-integration to prevent state paradoxes
-        for handler in self.collision_handlers:
-            handler.apply(self.objects, old_positions)
+        diff = pos[:, None, :] - pos[None, :, :]
+        dist = np.linalg.norm(diff, axis=-1)
+        np.fill_diagonal(dist, np.inf)
+        if np.min(dist) < MIN_DIST:
+            valid = False
+            break
+            
+    if valid:
+        if not np.all(np.isfinite(trajectory_pos)) or np.max(np.abs(trajectory_pos)) > MAX_POS:
+            valid = False
+            
+    if valid:
+        pos_std = np.std(trajectory_pos, axis=0)
+        pos_std_norm = np.linalg.norm(pos_std, axis=-1)
+        if np.any(pos_std_norm < MIN_STD):
+            valid = False
 
-        for sensor in self.sensors:
-            if hasattr(sensor, "tick"):
-                sensor.tick()
-
-    def run(self, duration):
-        steps = round(duration / DT)
-        for _ in range(steps):
-            self.step()
+    return valid, trajectory_pos, trajectory_vel
