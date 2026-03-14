@@ -1,0 +1,4 @@
+include README.md
+include LICENSE
+recursive-include engine *.py
+recursive-include archive_v1_engine/engine *.py
